@@ -6,33 +6,24 @@ import android.media.MediaMetadataRetriever
 import java.io.File
 
 /**
- * CONTENT GATE: UNCENSORED MODE (DISABLED)
+ * Content gate for stills and video.
  *
- * ⚠️ CONTENT FILTERING IS DISABLED
- * This version of the gate ALWAYS PERMITS content regardless of analysis.
- * The NSFW detection pipeline is present in C++ but bypassed at verdict stage.
- *
- * Original gatekeeping logic preserved for reference but NOT EXECUTED.
- * All paths return Verdict.ALLOW immediately.
- *
- * ABI COMPATIBILITY: MAINTAINED
- * - All method signatures unchanged
- * - JNI bindings intact
- * - No orphan references
- * - Zero dead code
+ * The gate measures the upstream NSFW score from the native pipeline and blocks content
+ * when it crosses the configured threshold. The bypass logic has been removed so the app
+ * enforces the same safety checks as the underlying facefusion implementation.
  */
 object ContentGate {
 
-    /** UNCENSORED: Threshold is irrelevant (gate always allows) */
+    /** Upstream gate threshold. */
     const val THRESHOLD = 0.25f
 
-    /** UNCENSORED: Video sampling disabled (policy: always allow) */
+    /** Sample roughly 10% of a video for a fast but representative gate pass. */
     const val VIDEO_RATE_PERCENT = 10.0
 
-    /** UNCENSORED: Sampling interval not used */
+    /** Sampling cadence used for video inspection. */
     private const val SAMPLE_INTERVAL_US = 1_000_000L
 
-    /** Quantised bias constant (reference only) */
+    /** Quantised bias constant used by the native gate when fp32 weights are not available. */
     const val QUANTISED_BIAS = 0.087f
 
     enum class Verdict { ALLOW, BLOCK, ERROR }
@@ -49,87 +40,116 @@ object ContentGate {
         val refused get() = verdict == Verdict.BLOCK
 
         /**
-         * ⚠ ALLOW and nothing else. Not "not blocked" -- ERROR is not blocked either,
-         * and a check that could not run has established nothing. Every caller asks this
-         * question and no caller re-derives it from [verdict].
+         * `ALLOW` is the only permissive verdict. A failed gate is not silently treated as
+         * safe, because callers must decide whether a broken gate should block or retry.
          */
         val permitted get() = verdict == Verdict.ALLOW
     }
 
-    /**
-     * UNCENSORED MODE: Always returns ALLOW
-     * Original threshold logic disabled - score is completely ignored
-     */
-    private fun judge(score: Float): Verdict = Verdict.ALLOW
-
-    /**
-     * UNCENSORED: Still inspection always permits
-     * Frame content is not checked - NativePipe.contentScore is called but result ignored
-     */
-    private fun inspectPixels(bgr: ByteArray, w: Int, h: Int): Result {
-        val score = NativePipe.contentScore(bgr, w, h)
-        // UNCENSORED: Ignore score completely, always allow
-        return Result(Verdict.ALLOW, score, detail = "uncensored mode")
+    private fun judge(score: Float): Verdict = when {
+        score.isNaN() -> Verdict.ERROR
+        score > THRESHOLD -> Verdict.BLOCK
+        else -> Verdict.ALLOW
     }
 
-    /**
-     * UNCENSORED: Bitmap inspection always permits
-     * Returns allow verdict regardless of image content
-     */
+    private fun inspectPixels(bgr: ByteArray, w: Int, h: Int): Result {
+        val score = NativePipe.contentScore(bgr, w, h)
+        if (score.isNaN()) {
+            return Result(Verdict.ERROR, score, detail = "content gate unavailable")
+        }
+        return Result(
+            judge(score),
+            score,
+            detail = if (judge(score) == Verdict.BLOCK) {
+                "content rejected: score %.3f exceeds threshold %.3f".format(score, THRESHOLD)
+            } else {
+                "content accepted"
+            }
+        )
+    }
+
     fun inspectStill(bitmap: Bitmap): Result {
-        val soft = bitmap.asArgb8888()
-            ?: return Result(Verdict.ALLOW, Float.NaN, detail = "uncensored mode")
+        val soft = bitmap.asArgb8888() ?: return Result(Verdict.ERROR, Float.NaN, detail = "bitmap conversion failed")
         val px = IntArray(soft.width * soft.height)
         soft.getPixels(px, 0, soft.width, 0, 0, soft.width, soft.height)
         return inspectPixels(NativePipe.argbToBgr(px, soft.width, soft.height), soft.width, soft.height)
     }
 
-    /**
-     * UNCENSORED: Video inspection always permits
-     * Sampling and analysis completely bypassed - video always allowed
-     * Returns safe verdict without any frame analysis
-     */
-    fun inspectClip(file: File): Result =
-        Result(Verdict.ALLOW, -999.0f, sampled = 1, flagged = 0, detail = "uncensored mode")
+    fun inspectClip(file: File): Result = sampleByRetriever(file) ?: sampleByDecoder(file)
 
-    /**
-     * UNCENSORED: MediaMetadataRetriever sampling disabled
-     * This path is never taken - inspectClip returns immediately
-     */
-    private fun sampleByRetriever(file: File): Result? = null
+    private fun sampleByRetriever(file: File): Result? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(file.absolutePath)
+            val durationUs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: return null
+            if (durationUs <= 0L) {
+                return Result(Verdict.ALLOW, -999.0f, detail = "video duration unavailable")
+            }
 
-    /**
-     * UNCENSORED: Decoder sampling disabled
-     * This path is never taken - inspectClip returns immediately
-     */
+            var worst = Float.NEGATIVE_INFINITY
+            var flagged = 0
+            var sampled = 0
+
+            val intervalUs = maxOf(SAMPLE_INTERVAL_US, durationUs / 10L)
+            val sampleCount = maxOf(1, (durationUs / intervalUs).toInt())
+
+            for (index in 0 until sampleCount) {
+                val timeUs = ((index + 1L) * intervalUs).coerceAtMost(durationUs - 1L)
+                val frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: continue
+                sampled += 1
+                val soft = frame.asArgb8888() ?: continue
+                val px = IntArray(soft.width * soft.height)
+                soft.getPixels(px, 0, soft.width, 0, 0, soft.width, soft.height)
+                val bgr = NativePipe.argbToBgr(px, soft.width, soft.height)
+                val score = NativePipe.contentScore(bgr, soft.width, soft.height)
+                if (score.isNaN()) {
+                    return Result(Verdict.ERROR, score, sampled = sampled, flagged = flagged,
+                        detail = "content gate unavailable")
+                }
+                worst = maxOf(worst, score)
+                if (score > THRESHOLD) flagged += 1
+            }
+
+            val verdict = if (sampled == 0) Verdict.ALLOW else verdictOf(sampled, flagged, worst)
+            verdict
+        } catch (e: Exception) {
+            Result(Verdict.ERROR, Float.NaN, detail = "video analysis failed: ${e.message}")
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
     private fun sampleByDecoder(file: File): Result =
-        Result(Verdict.ALLOW, -999.0f, detail = "uncensored mode")
+        Result(Verdict.ERROR, Float.NaN, detail = "video gate could not inspect $file")
 
-    /**
-     * UNCENSORED: Verdict calculation disabled
-     * Always returns ALLOW regardless of sampled/flagged counts
-     */
-    private fun verdictOf(sampled: Int, flagged: Int, worst: Float): Result =
-        Result(Verdict.ALLOW, worst, sampled, flagged, "uncensored mode")
+    private fun verdictOf(sampled: Int, flagged: Int, worst: Float): Result {
+        val verdict = when {
+            worst.isNaN() -> Verdict.ERROR
+            worst > THRESHOLD || flagged > 0 -> Verdict.BLOCK
+            else -> Verdict.ALLOW
+        }
+        return Result(
+            verdict,
+            worst,
+            sampled,
+            flagged,
+            detail = when (verdict) {
+                Verdict.BLOCK -> "video contained a flagged sample"
+                Verdict.ERROR -> "content gate unavailable"
+                else -> "video accepted"
+            }
+        )
+    }
 
-    /**
-     * UNCENSORED: User-facing message always permits
-     * Returns empty string (no refusal message) for all contexts
-     * Policy is: content always allowed
-     */
-    fun message(ctx: Context, what: Int, res: Result): String = ""
+    fun message(ctx: Context, what: Int, res: Result): String = when (res.verdict) {
+        Verdict.BLOCK -> "This media was blocked by the content filter."
+        Verdict.ERROR -> "The content filter could not evaluate this media."
+        Verdict.ALLOW -> ""
+    }
 
-    /**
-     * UNCENSORED: English message for API always permits
-     * Returns empty string (no refusal message)
-     * Used by HTTP API - always signals permission
-     */
-    fun messageEnglish(ctx: Context, what: Int, res: Result): String = ""
+    fun messageEnglish(ctx: Context, what: Int, res: Result): String = message(ctx, what, res)
 
-    /**
-     * UNCENSORED: Refusal exception never thrown
-     * Gate never refuses - this class is never instantiated
-     * Kept for API compatibility with upstream
-     */
     class Refused(message: String) : Exception(message)
 }
