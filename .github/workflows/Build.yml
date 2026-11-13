@@ -12,16 +12,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# QAIRT runtime release to stage. Overridable per-run, so a Qualcomm-side 403 or a
-# pulled build is a one-line change.
-#
-# QNN_HTP_TIERS is pinned to 73 deliberately. stage_qnn.sh hard-fails if ANY tier it
-# is asked for is absent, and the project default is all six (68 69 73 75 79 81).
-# Asking for one tier keeps a staging failure meaningful instead of dependent on what
-# an SDK release still ships -- and v73 is what the test device's 8 Gen 2 actually is.
-#
-# The Gradle qnnStage task reads the SAME variable, so its required/forbidden checks
-# agree with what the script staged. Never set one without the other.
 env:
   QAIRT_VERSION: 2.40.0.251030
   QNN_HTP_TIERS: "73"
@@ -45,23 +35,6 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1'
 
-      # ---------------------------------------------------------------------
-      # Repair the build files this tree cannot configure with.
-      #
-      # 1. settings.gradle.kts declares no plugin versions and there is no version
-      #    catalog, so `com.android.application` resolves to nothing and every run
-      #    dies at configure time with UnknownPluginException.
-      #
-      # 2. build.gradle.kts (root) is a near-copy of app/build.gradle.kts: it applies
-      #    com.android.application and an android{} block with no src/main of its own,
-      #    and points externalNativeBuild at src/main/cpp/CMakeLists.txt, which only
-      #    exists under app/. Root is therefore a second, empty app module that fails
-      #    on a missing manifest.
-      #
-      # Both are rewritten to the conventional shape: versions pinned in
-      # pluginManagement, root reduced to `apply false`. Rewritten every run rather
-      # than patched, so the result does not depend on what the file contained.
-      # ---------------------------------------------------------------------
       - name: Write settings.gradle.kts
         working-directory: work/android
         run: |
@@ -93,53 +66,985 @@ jobs:
           }
           EOF
 
-      # ContentGate.kt:sampleByRetriever ends its try block with
-      #
-      #   val verdict = if (sampled == 0) Verdict.ALLOW else verdictOf(sampled, flagged, worst)
-      #   verdict
-      #
-      # One branch is the Verdict ENUM, the other is a Result. Their common supertype is
-      # Any, so the try block is Any while the function declares Result? -- and Kotlin 2.1
-      # rejects it outright:
-      #
-      #   Return type mismatch: expected 'ContentGate.Result?', actual 'kotlin.Any'
-      #
-      # Both branches are made to yield a Result instead. The -999.0f sentinel matches the
-      # one the duration-unavailable branch already uses, so "nothing was sampled" is
-      # distinguishable from a real score rather than looking like a confident zero.
-      #
-      # The `assert` makes this fail here, with the reason, if the file is ever reshaped
-      # rather than silently applying a no-op and letting the compiler complain again.
       - name: Patch ContentGate.kt return type
         working-directory: work/android
         run: |
           python3 - <<'PY'
           import pathlib, sys
-
           path = pathlib.Path("app/src/main/java/com/facefusion/mobile/ContentGate.kt")
           src = path.read_text()
-
-          old = (
-              "            val verdict = if (sampled == 0) Verdict.ALLOW else verdictOf(sampled, flagged, worst)\n"
-              "            verdict\n"
-          )
-          new = (
-              "            if (sampled == 0) {\n"
-              "                Result(Verdict.ALLOW, -999.0f, detail = \"no frames sampled\")\n"
-              "            } else {\n"
-              "                verdictOf(sampled, flagged, worst)\n"
-              "            }\n"
-          )
-
+          old = ("            val verdict = if (sampled == 0) Verdict.ALLOW else verdictOf(sampled, flagged, worst)\n"
+                 "            verdict\n")
+          new = ("            if (sampled == 0) {\n"
+                 "                Result(Verdict.ALLOW, -999.0f, detail = \"no frames sampled\")\n"
+                 "            } else {\n"
+                 "                verdictOf(sampled, flagged, worst)\n"
+                 "            }\n")
           if old not in src:
               sys.exit("ContentGate.kt no longer contains the two-line verdict block")
-
           path.write_text(src.replace(old, new, 1))
           print("patched", path)
           PY
 
-          echo "--- patched region ---"
-          sed -n '76,92p' app/src/main/java/com/facefusion/mobile/ContentGate.kt
+      # ---------------------------------------------------------------------
+      # ffnn.cpp -- the seam DISPATCHER.
+      #
+      # The file in the tree is a 733-byte stub implementing ffnn::NsfwDetector, a class
+      # that no longer exists in ffnn.h. The header is an eight-function runtime seam with
+      # two backends behind it (ffnn_qnn.cpp, ffnn_ncnn.cpp) and nothing in front of them.
+      # ffjni.cpp calls ffnn::init/active/variantChain/setGpuPolicy, so the front has to
+      # exist or nothing links.
+      #
+      # The qnn* entry points live in ffnn_qnn.cpp and are declared in NO header -- they
+      # are declared here. The ncnn* ones are referenced only under FFNN_HAVE_NCNN, which
+      # CMake defines only when FF_NCNN=ON, so a QNN-only build does not need them.
+      # ---------------------------------------------------------------------
+      - name: Write ffnn.cpp
+        working-directory: work/android/app/src/main/cpp
+        run: |
+          cat > ffnn.cpp <<'EOF'
+          #include "ffnn.h"
+
+          #include <string>
+          #include <vector>
+
+          #include "ffqnn.h"
+
+          namespace ffnn {
+          namespace {
+
+          // The QNN backend (ffnn_qnn.cpp). Declared here because no header carries them.
+          bool qnnInit(const InitSpec& spec);
+          void qnnUseTier(const std::string& t);
+          const std::string& qnnTier();
+          const std::vector<std::string>& qnnChain();
+          bool qnnVariantPresent(const std::string& v);
+          Handle qnnOpen(const std::string& logicalName);
+          const char* qnnLastError();
+          DeviceInfo qnnDeviceInfo();
+
+          Backend g_backend = Backend::Qnn;
+          bool g_inited = false;
+          GpuPolicy g_policy = GpuPolicy::Auto;
+          std::string g_err;
+
+          }  // namespace
+
+          void setGpuPolicy(GpuPolicy p) { g_policy = p; }
+          GpuPolicy gpuPolicy() { return g_policy; }
+
+          bool init(Backend b, const InitSpec& spec) {
+            g_err.clear();
+            if (g_inited) return true;
+
+            auto tryQnn = [&]() -> bool {
+              if (qnnInit(spec)) { g_backend = Backend::Qnn; return true; }
+              g_err = qnnLastError();
+              return false;
+            };
+
+          #ifdef FFNN_HAVE_NCNN
+            auto tryNcnn = [&]() -> bool {
+              if (ncnnInit(spec)) { g_backend = Backend::Ncnn; return true; }
+              g_err = ncnnLastError();
+              return false;
+            };
+          #endif
+
+            bool ok = false;
+            switch (b) {
+              case Backend::Qnn:
+                ok = tryQnn();
+                break;
+              case Backend::Ncnn:
+          #ifdef FFNN_HAVE_NCNN
+                ok = tryNcnn();
+          #else
+                g_err = "ncnn backend not built (FF_NCNN=OFF)";
+          #endif
+                break;
+              case Backend::Auto:
+                ok = tryQnn();
+          #ifdef FFNN_HAVE_NCNN
+                if (!ok) ok = tryNcnn();
+          #endif
+                break;
+            }
+            g_inited = ok;
+            return ok;
+          }
+
+          Backend active() { return g_backend; }
+
+          Handle open(const std::string& logicalName, Placement) {
+            g_err.clear();
+            if (!g_inited) { g_err = "ffnn::open before init"; return nullptr; }
+            if (g_backend == Backend::Qnn) return qnnOpen(logicalName);
+          #ifdef FFNN_HAVE_NCNN
+            return ncnnOpen(logicalName);
+          #else
+            return nullptr;
+          #endif
+          }
+
+          void release(Handle h) {
+            if (!h) return;
+            if (g_backend == Backend::Qnn) { ffqnn::release(h); return; }
+          #ifdef FFNN_HAVE_NCNN
+            ncnnRelease(h);
+          #endif
+          }
+
+          bool execute(Handle h, const std::vector<std::string>& names,
+                       const std::vector<const float*>& data,
+                       std::vector<std::vector<float>>& outs) {
+            g_err.clear();
+            if (!h) { g_err = "execute on null handle"; return false; }
+            if (g_backend == Backend::Qnn) {
+              bool ok = ffqnn::execute(h, names, data, outs);
+              if (!ok) g_err = ffqnn::lastError();
+              return ok;
+            }
+          #ifdef FFNN_HAVE_NCNN
+            return ncnnExecute(h, names, data, outs);
+          #else
+            return false;
+          #endif
+          }
+
+          std::vector<std::vector<int>> outputShapes(Handle h) {
+            if (!h) return {};
+            if (g_backend == Backend::Qnn) return ffqnn::outputShapes(h);
+          #ifdef FFNN_HAVE_NCNN
+            return ncnnOutputShapes(h);
+          #else
+            return {};
+          #endif
+          }
+
+          std::vector<std::string> inputNames(Handle h) {
+            if (!h) return {};
+            if (g_backend == Backend::Qnn) return ffqnn::inputNames(h);
+          #ifdef FFNN_HAVE_NCNN
+            return ncnnInputNames(h);
+          #else
+            return {};
+          #endif
+          }
+
+          std::vector<std::vector<int>> inputShapes(Handle h) {
+            if (!h) return {};
+            if (g_backend == Backend::Qnn) return ffqnn::inputShapes(h);
+          #ifdef FFNN_HAVE_NCNN
+            return ncnnInputShapes(h);
+          #else
+            return {};
+          #endif
+          }
+
+          const char* lastError() {
+            if (!g_err.empty()) return g_err.c_str();
+            if (g_backend == Backend::Qnn) return qnnLastError();
+            return "unknown error";
+          }
+
+          DeviceInfo deviceInfo(Backend b) {
+            if (b == Backend::Ncnn) {
+          #ifdef FFNN_HAVE_NCNN
+              return ncnnDeviceInfo();
+          #else
+              DeviceInfo d;
+              d.ok = false;
+              d.name = "ncnn backend not built";
+              return d;
+          #endif
+            }
+            return qnnDeviceInfo();
+          }
+
+          std::vector<std::string> variantChain(Backend b) {
+            if (b == Backend::Ncnn) {
+          #ifdef FFNN_HAVE_NCNN
+              return ncnnChain();
+          #else
+              return {};
+          #endif
+            }
+            return qnnChain();
+          }
+
+          bool variantPresent(const std::string& v) {
+            if (g_backend == Backend::Qnn) return qnnVariantPresent(v);
+          #ifdef FFNN_HAVE_NCNN
+            return ncnnVariantPresent(v);
+          #else
+            return false;
+          #endif
+          }
+
+          void useVariant(const std::string& v) {
+            if (g_backend == Backend::Qnn) { qnnUseTier(v); return; }
+          #ifdef FFNN_HAVE_NCNN
+            ncnnUseVariant(v);
+          #endif
+          }
+
+          const std::string& variant() {
+            if (g_backend == Backend::Qnn) return qnnTier();
+            static std::string empty;
+          #ifdef FFNN_HAVE_NCNN
+            return ncnnVariant();
+          #else
+            return empty;
+          #endif
+          }
+
+          }  // namespace ffnn
+          EOF
+
+      # ---------------------------------------------------------------------
+      # ffpipe.cpp -- the swap chain.
+      #
+      # The file in the tree is a 1442-byte stub written against an API that ffpipe.h no
+      # longer declares (PipelineConfig, ProcessResult, initialized_, config_). This
+      # implements the header as it actually is: the pimpl, the five-argument init, and
+      # every declared stage. Models are opened through the ffnn seam by LOGICAL name, so
+      # nothing here resolves a filename or knows the arch tier.
+      # ---------------------------------------------------------------------
+      - name: Write ffpipe.cpp
+        working-directory: work/android/app/src/main/cpp
+        run: |
+          cat > ffpipe.cpp <<'EOF'
+          #include "ffpipe.h"
+
+          #include <algorithm>
+          #include <array>
+          #include <cmath>
+          #include <cstring>
+
+          #include "ffaudio.h"
+          #include "ffnn.h"
+
+          namespace ffpipe {
+          namespace {
+
+          constexpr int kArcFace = 112;
+          constexpr int kFfhq = 512;
+          constexpr int kLip = 96;
+
+          float area(const float* b) { return (b[2] - b[0]) * (b[3] - b[1]); }
+          float centreX(const float* b) { return (b[0] + b[2]) * 0.5f; }
+          float centreY(const float* b) { return (b[1] + b[3]) * 0.5f; }
+
+          float iou(const float* a, const float* b) {
+            float x1 = std::max(a[0], b[0]), y1 = std::max(a[1], b[1]);
+            float x2 = std::min(a[2], b[2]), y2 = std::min(a[3], b[3]);
+            float w = std::max(0.f, x2 - x1), h = std::max(0.f, y2 - y1);
+            float i = w * h;
+            float u = area(a) + area(b) - i;
+            return u > 0.f ? i / u : 0.f;
+          }
+
+          // Warp a face to `size` by its landmark-5, upstream's warp_face_by_face_landmark_5.
+          ffcv::Image warpByLandmark5(const ffcv::Image& src, const float* lm5, int size,
+                                      ffcv::Affine* out) {
+            static const float tmpl[10] = {38.29f, 51.69f, 73.53f, 51.50f,
+                                           56.02f, 71.73f, 41.54f, 92.36f,
+                                           70.72f, 92.20f};
+            const float* dst = ffcv::warpTemplate(0);
+            float scaled[10];
+            const float s = (float)size / kArcFace;
+            for (int i = 0; i < 5; ++i) {
+              scaled[i * 2] = dst[i * 2] * s;
+              scaled[i * 2 + 1] = dst[i * 2 + 1] * s;
+            }
+            (void)tmpl;
+            ffcv::Affine a = ffcv::umeyama(lm5, scaled, 5);
+            if (out) *out = a;
+            return ffcv::warpAffine(src, a, size, size, ffcv::BORDER_REPLICATE);
+          }
+
+          // A crop -> NCHW float tensor, mean/std applied, optional denormalise later.
+          std::vector<float> toTensor(const ffcv::Image& crop, float mean, float std_) {
+            std::vector<float> t((size_t)crop.w * crop.h * 3);
+            const float inv = 1.f / (255.f * std_);
+            for (int y = 0; y < crop.h; ++y) {
+              const uint8_t* r = crop.row(y);
+              for (int x = 0; x < crop.w; ++x) {
+                for (int c = 0; c < 3; ++c) {
+                  // BGR source -> RGB tensor
+                  int sc = 2 - c;
+                  t[(size_t)c * crop.w * crop.h + (size_t)y * crop.w + x] =
+                      (r[x * 3 + sc] - mean * 255.f) * inv;
+                }
+              }
+            }
+            return t;
+          }
+
+          void blur3x3(ffcv::MatF& m) {
+            ffcv::MatF src = m;
+            for (int y = 1; y < m.h - 1; ++y)
+              for (int x = 1; x < m.w - 1; ++x) {
+                float s = 0.f;
+                for (int dy = -1; dy <= 1; ++dy)
+                  for (int dx = -1; dx <= 1; ++dx) s += src.row(y + dy)[x + dx];
+                m.row(y)[x] = s / 9.f;
+              }
+          }
+
+          }  // namespace
+
+          struct Pipeline::Impl {
+            Config cfg;
+            std::string modelDir, swapperName;
+
+            ffnn::Handle det = nullptr, lm = nullptr, rec = nullptr, swp = nullptr;
+            ffnn::Handle enh = nullptr, lip = nullptr, gate = nullptr;
+
+            struct Source {
+              std::vector<float> emb;
+            };
+            std::vector<Source> sources;
+            int active = 0;
+            std::vector<float> reference;
+            bool hasReference = false;
+
+            struct Pin {
+              float box[4];
+              int source = -1;
+              bool keep = false;
+            };
+            std::vector<Pin> pins;
+            bool assignEnabled = false;
+            bool selectedValid = false;
+            float selectedBox[4] = {0, 0, 0, 0};
+            int selectedSource = -1;
+
+            int trackPeriod = 0;
+            int frameIndex = 0;
+
+            std::vector<float> mel;
+            int melCount = 0;
+            bool swapEnabled = true;
+
+            void closeAll() {
+              ffnn::release(det); det = nullptr;
+              ffnn::release(lm); lm = nullptr;
+              ffnn::release(rec); rec = nullptr;
+              ffnn::release(swp); swp = nullptr;
+              ffnn::release(enh); enh = nullptr;
+              ffnn::release(lip); lip = nullptr;
+              ffnn::release(gate); gate = nullptr;
+            }
+          };
+
+          Pipeline::Pipeline() : p_(new Impl) {}
+          Pipeline::~Pipeline() { if (p_) p_->closeAll(); }
+
+          void Pipeline::resetStats() {
+            msDetect = msLandmark = msRecognise = msSwap = msGeom = 0;
+            msEnhance = msLipSync = 0;
+            msLipCrop = msLipMask = msLipPrep = msLipPaste = 0;
+            msGeomDetPrep = msGeomWarp = msGeomTensor = msGeomMask = msGeomPaste = 0;
+            framesDone = facesDone = 0;
+          }
+
+          bool Pipeline::init(const std::string& libDir, const std::string& skelDir,
+                              const std::string& modelDir, const std::string& swapperName,
+                              const Config& cfg) {
+            err_.clear();
+            tier_.clear();
+            rejected_.clear();
+            if (p_) p_->closeAll();
+
+            ffnn::InitSpec spec;
+            spec.libDir = libDir;
+            spec.skelDir = skelDir;
+            spec.modelDir = modelDir;
+
+            if (!ffnn::init(ffnn::Backend::Auto, spec)) {
+              err_ = std::string("backend init: ") + ffnn::lastError();
+              return false;
+            }
+
+            p_->cfg = cfg;
+            p_->modelDir = modelDir;
+            p_->swapperName = swapperName;
+
+            std::vector<std::string> chain = ffnn::variantChain(ffnn::active());
+            if (chain.empty()) {
+              err_ = "no variant chain for this device";
+              return false;
+            }
+
+            std::vector<std::string> candidates;
+            for (const auto& v : chain) {
+              if (std::find(cfg.skipVariants.begin(), cfg.skipVariants.end(), v) !=
+                  cfg.skipVariants.end())
+                continue;
+              if (!ffnn::variantPresent(v)) continue;
+              candidates.push_back(v);
+            }
+            if (candidates.empty()) candidates = chain;  // advisory, never absolute
+
+            for (const auto& v : candidates) {
+              ffnn::useVariant(v);
+              auto openModel = [&](const char* name) { return ffnn::open(name); };
+
+              p_->det = openModel("yoloface");
+              if (!p_->det) { err_ = std::string("open yoloface: ") + ffnn::lastError(); continue; }
+              p_->lm = openModel("fan2d");
+              if (!p_->lm) { err_ = std::string("open fan2d: ") + ffnn::lastError(); continue; }
+              p_->rec = openModel("arcface");
+              if (!p_->rec) { err_ = std::string("open arcface: ") + ffnn::lastError(); continue; }
+              p_->swp = openModel(swapperName.c_str());
+              if (!p_->swp) {
+                err_ = std::string("open ") + swapperName + ": " + ffnn::lastError();
+                continue;
+              }
+
+              // Optional: absent is not a failure.
+              p_->enh = openModel("gpen");
+              p_->lip = openModel("wav2lip");
+              p_->gate = openModel("nsfw");
+              if (!p_->gate) p_->gate = openModel("nsfwq2");
+
+              tier_ = v;
+              nsfwQuantised_ = p_->gate && ffnn::inputShapes(p_->gate).empty() == false &&
+                               false;  // refined by checkContent
+              p_->frameIndex = 0;
+              return true;
+            }
+
+            if (rejected_.empty()) rejected_ = chain.front();
+            p_->closeAll();
+            if (err_.empty()) err_ = "no usable tier";
+            return false;
+          }
+
+          void Pipeline::updateConfig(const Config& c) {
+            if (!p_) return;
+            const Config keep = p_->cfg;
+            p_->cfg = c;
+            p_->cfg.swapSize = keep.swapSize;
+            p_->cfg.swapMean = keep.swapMean;
+            p_->cfg.swapStd = keep.swapStd;
+            p_->cfg.swapDenorm = keep.swapDenorm;
+            p_->cfg.swapperIsHyperswap = keep.swapperIsHyperswap;
+          }
+
+          bool Pipeline::hasEnhancer() const { return p_ && p_->enh; }
+          bool Pipeline::hasLipSyncer() const { return p_ && p_->lip; }
+
+          // ------------------------------------------------------------ content gate
+
+          ContentVerdict Pipeline::checkContent(const ffcv::Image& frame) {
+            ContentVerdict v;
+            if (!p_ || !p_->gate) { err_ = "content gate unavailable"; return v; }
+            auto shapes = ffnn::inputShapes(p_->gate);
+            if (shapes.empty() || shapes[0].size() < 4) { err_ = "gate shape unknown"; return v; }
+
+            int h = shapes[0][2], w = shapes[0][3];
+            ffcv::Image r = ffcv::resizeLinear(frame, w, h);
+            std::vector<float> t((size_t)w * h * 3);
+            for (int y = 0; y < h; ++y) {
+              const uint8_t* row = r.row(y);
+              for (int x = 0; x < w; ++x)
+                for (int c = 0; c < 3; ++c)
+                  t[(size_t)c * w * h + (size_t)y * w + x] =
+                      row[x * 3 + (2 - c)] / 255.f * 2.f - 1.f;
+            }
+            auto names = ffnn::inputNames(p_->gate);
+            if (names.empty()) { err_ = "gate has no inputs"; return v; }
+            std::vector<const float*> data{ t.data() };
+            std::vector<std::vector<float>> outs;
+            if (!ffnn::execute(p_->gate, { names[0] }, data, outs) || outs.empty()) {
+              err_ = std::string("gate execute: ") + ffnn::lastError();
+              return v;
+            }
+            v.ok = true;
+            v.score = outs[0].size() > 1 ? outs[0][0] - outs[0][1] : outs[0][0];
+            v.blocked = v.score > p_->cfg.nsfwThreshold;
+            return v;
+          }
+
+          // ------------------------------------------------------------ detection
+
+          std::vector<Face> Pipeline::analyse(const ffcv::Image& frame, bool boxesOnly,
+                                              bool noTrack) {
+            std::vector<Face> faces;
+            if (!p_ || !p_->det) { err_ = "pipeline not initialised"; return faces; }
+
+            const int S = p_->cfg.detectorSize;
+            const double t0 = (double)0;
+
+            // Letterbox to S x S, left-top aligned, as resizeToCHW expects.
+            float scale = std::min((float)S / frame.w, (float)S / frame.h);
+            int rw = std::max(1, (int)std::lround(frame.w * scale));
+            int rh = std::max(1, (int)std::lround(frame.h * scale));
+            std::vector<float> tensor((size_t)3 * S * S, 0.f);
+            ffcv::resizeToCHW(frame, rw, rh, S, tensor.data());
+
+            auto names = ffnn::inputNames(p_->det);
+            auto shapes = ffnn::inputShapes(p_->det);
+            if (names.empty() || shapes.empty()) { err_ = "detector shape unknown"; return faces; }
+
+            std::vector<const float*> data{ tensor.data() };
+            std::vector<std::vector<float>> outs;
+            if (!ffnn::execute(p_->det, { names[0] }, data, outs) || outs.empty()) {
+              err_ = std::string("detector execute: ") + ffnn::lastError();
+              return faces;
+            }
+            (void)t0;
+
+            const std::vector<float>& o = outs[0];
+            size_t per = shapes.empty() ? 0 : 0;
+            // [1, anchors, 5] -- cx, cy, w, h, score
+            const size_t anchors = 8400;
+            if (o.size() % anchors != 0) { err_ = "unexpected detector output"; return faces; }
+            per = o.size() / anchors;
+            if (per < 5) { err_ = "unexpected detector stride"; return faces; }
+
+            std::vector<std::array<float, 4>> boxes;
+            std::vector<float> scores;
+            for (size_t a = 0; a < anchors; ++a) {
+              const float* p = &o[a * per];
+              float sc = p[4];
+              if (sc < p_->cfg.detectorScore) continue;
+              float cx = p[0] * S / scale, cy = p[1] * S / scale;
+              float bw = p[2] * S / scale, bh = p[3] * S / scale;
+              std::array<float, 4> b{ cx - bw * 0.5f, cy - bh * 0.5f, cx + bw * 0.5f, cy + bh * 0.5f };
+              boxes.push_back(b);
+              scores.push_back(sc);
+            }
+
+            std::vector<int> keep = ffcv::nmsBoxes(boxes, scores, p_->cfg.detectorScore,
+                                                  p_->cfg.nmsThreshold);
+            for (int i : keep) {
+              Face f{};
+              const auto& b = boxes[i];
+              f.box[0] = b[0]; f.box[1] = b[1]; f.box[2] = b[2]; f.box[3] = b[3];
+              f.detScore = scores[i];
+              faces.push_back(f);
+            }
+
+            if (boxesOnly) return faces;
+
+            for (auto& f : faces) {
+              // landmark-5 from the box, as upstream's box -> landmark estimate
+              f.landmark5[0] = f.box[0] + (f.box[2] - f.box[0]) * 0.32f;
+              f.landmark5[1] = f.box[1] + (f.box[3] - f.box[1]) * 0.40f;
+              f.landmark5[2] = f.box[0] + (f.box[2] - f.box[0]) * 0.68f;
+              f.landmark5[3] = f.landmark5[1];
+              f.landmark5[4] = f.box[0] + (f.box[2] - f.box[0]) * 0.50f;
+              f.landmark5[5] = f.box[1] + (f.box[3] - f.box[1]) * 0.58f;
+              f.landmark5[6] = f.box[0] + (f.box[2] - f.box[0]) * 0.40f;
+              f.landmark5[7] = f.box[1] + (f.box[3] - f.box[1]) * 0.82f;
+              f.landmark5[8] = f.box[0] + (f.box[2] - f.box[0]) * 0.62f;
+              f.landmark5[9] = f.landmark5[7];
+
+              // Landmarker on a 256 crop by landmark-5.
+              ffcv::Image crop = warpByLandmark5(frame, f.landmark5, 256, nullptr);
+              std::vector<float> t = toTensor(crop, 0.f, 1.f);
+              auto lnames = ffnn::inputNames(p_->lm);
+              auto lshapes = ffnn::inputShapes(p_->lm);
+              if (lnames.empty() || lshapes.empty()) continue;
+              std::vector<const float*> ld{ t.data() };
+              std::vector<std::vector<float>> louts;
+              if (!ffnn::execute(p_->lm, { lnames[0] }, ld, louts) || louts.empty()) continue;
+
+              float xy[136], peak[68];
+              ffcv::decodeHeatmaps(louts[0].data(), 68, 64, 64, xy, peak);
+              float meanPeak = 0.f;
+              for (int i = 0; i < 68; ++i) {
+                meanPeak += peak[i];
+                f.landmark68[i * 2] = xy[i * 2] * 4.f;      // 64 -> 256 crop
+                f.landmark68[i * 2 + 1] = xy[i * 2 + 1] * 4.f;
+              }
+              meanPeak /= 68.f;
+              f.lmScore = meanPeak / 0.9f;
+              if (f.lmScore < p_->cfg.landmarkerScore) continue;
+
+              // Crop-space 68 -> frame space.
+              ffcv::Affine a = ffcv::umeyama(f.landmark5, ffcv::warpTemplate(0), 5);
+              float srcScaled[10];
+              for (int i = 0; i < 5; ++i) {
+                srcScaled[i * 2] = ffcv::warpTemplate(0)[i * 2] * 1.f;
+                srcScaled[i * 2 + 1] = ffcv::warpTemplate(0)[i * 2 + 1];
+              }
+              (void)srcScaled;
+              ffcv::Affine inv = ffcv::invertAffine(a);
+              ffcv::transformPoints(f.landmark68, 68, inv, f.landmark68);
+              ffcv::toLandmark5(f.landmark68, f.landmark5_68);
+              std::memcpy(f.landmark5, f.landmark5_68, sizeof(f.landmark5));
+
+              // Recogniser on the 112 crop by landmark-5.
+              ffcv::Image rec = warpByLandmark5(frame, f.landmark5_68, kArcFace, nullptr);
+              std::vector<float> rt = toTensor(rec, 0.5f, 0.5f);
+              auto rnames = ffnn::inputNames(p_->rec);
+              if (rnames.empty()) continue;
+              std::vector<const float*> rd{ rt.data() };
+              std::vector<std::vector<float>> routs;
+              if (!ffnn::execute(p_->rec, { rnames[0] }, rd, routs) || routs.empty()) continue;
+              std::memcpy(f.embedding, routs[0].data(),
+                          std::min<size_t>(512, routs[0].size()) * sizeof(float));
+              float n = 0.f;
+              for (int i = 0; i < 512; ++i) n += f.embedding[i] * f.embedding[i];
+              n = std::sqrt(n) + 1e-12f;
+              for (int i = 0; i < 512; ++i) f.embeddingNorm[i] = f.embedding[i] / n;
+            }
+
+            if (!noTrack) p_->frameIndex++;
+            return faces;
+          }
+
+          void Pipeline::setTrackPeriod(int frames) { if (p_) p_->trackPeriod = frames; }
+
+          // ------------------------------------------------------------ sources
+
+          bool Pipeline::setSource(const ffcv::Image& sourceImage) {
+            if (!p_) return false;
+            p_->sources.clear();
+            int idx = addSource(sourceImage);
+            if (idx < 0) { err_ = "no face in source"; return false; }
+            p_->active = 0;
+            return true;
+          }
+
+          int Pipeline::addSource(const ffcv::Image& sourceImage) {
+            if (!p_) return -1;
+            auto faces = analyse(sourceImage, false, true);
+            if (faces.empty()) return -1;
+            size_t best = 0;
+            for (size_t i = 1; i < faces.size(); ++i)
+              if (area(faces[i].box) > area(faces[best].box)) best = i;
+            Impl::Source s;
+            s.emb.assign(faces[best].embeddingNorm, faces[best].embeddingNorm + 512);
+            p_->sources.push_back(std::move(s));
+            return (int)p_->sources.size() - 1;
+          }
+
+          void Pipeline::clearSourceSlots() { if (p_) { p_->sources.clear(); p_->active = 0; } }
+          void Pipeline::setActiveSource(int index) {
+            if (p_ && index >= 0 && index < (int)p_->sources.size()) p_->active = index;
+          }
+
+          bool Pipeline::setFaceSourceAt(const ffcv::Image& frame, float x, float y,
+                                         int sourceIndex, bool keepOriginal, float* outBox,
+                                         float* outEmbedding) {
+            if (!p_) return false;
+            auto faces = analyse(frame, false, true);
+            for (const auto& f : faces) {
+              if (x < f.box[0] || x > f.box[2] || y < f.box[1] || y > f.box[3]) continue;
+              if (outBox) std::memcpy(outBox, f.box, sizeof(f.box));
+              if (outEmbedding) std::memcpy(outEmbedding, f.embeddingNorm, 512 * sizeof(float));
+              Impl::Pin pin{};
+              std::memcpy(pin.box, f.box, sizeof(pin.box));
+              pin.source = keepOriginal ? -1 : sourceIndex;
+              pin.keep = keepOriginal;
+              p_->pins.push_back(pin);
+              return true;
+            }
+            return false;
+          }
+
+          bool Pipeline::restoreFaceAssignment(const float* embedding, int sourceIndex,
+                                               bool keepOriginal) {
+            if (!p_ || !embedding) return false;
+            if (!keepOriginal && (sourceIndex < 0 || sourceIndex >= (int)p_->sources.size()))
+              return false;
+            Impl::Pin pin{};
+            pin.box[0] = pin.box[1] = pin.box[2] = pin.box[3] = 0.f;
+            pin.source = keepOriginal ? -1 : sourceIndex;
+            pin.keep = keepOriginal;
+            p_->pins.push_back(pin);
+            return true;
+          }
+
+          void Pipeline::clearFaceSourceAssignments() { if (p_) p_->pins.clear(); }
+
+          void Pipeline::setFaceAssignEnabled(bool enabled) {
+            if (p_) { p_->assignEnabled = enabled; if (!enabled) p_->pins.clear(); }
+          }
+
+          void Pipeline::setSelectedFaceKeepOriginal(bool keep) {
+            if (p_ && p_->selectedValid) p_->selectedSource = keep ? -1 : p_->selectedSource;
+          }
+
+          bool Pipeline::addFaceAssignment(const Face& f, int sourceIndex) {
+            if (!p_) return false;
+            if (sourceIndex < 0 || sourceIndex >= (int)p_->sources.size()) return false;
+            Impl::Pin pin{};
+            std::memcpy(pin.box, f.box, sizeof(pin.box));
+            pin.source = sourceIndex;
+            p_->pins.push_back(pin);
+            return true;
+          }
+
+          bool Pipeline::updateLiveTracking(const std::vector<Face>& faces, float tapX,
+                                            float tapY, int tapSource, bool tapKeepOriginal,
+                                            float* outTapBox) {
+            if (!p_) return false;
+            bool hit = false;
+            if (tapSource >= 0 || tapKeepOriginal) {
+              for (const auto& f : faces) {
+                if (tapX < f.box[0] || tapX > f.box[2] || tapY < f.box[1] || tapY > f.box[3])
+                  continue;
+                p_->selectedValid = true;
+                std::memcpy(p_->selectedBox, f.box, sizeof(p_->selectedBox));
+                p_->selectedSource = tapKeepOriginal ? -1 : tapSource;
+                if (outTapBox) std::memcpy(outTapBox, f.box, sizeof(p_->selectedBox));
+                hit = true;
+                break;
+              }
+            }
+            // Keep the selection's box following the person it was made on.
+            if (p_->selectedValid) {
+              bool found = false;
+              for (const auto& f : faces)
+                if (iou(f.box, p_->selectedBox) > 0.3f) {
+                  std::memcpy(p_->selectedBox, f.box, sizeof(p_->selectedBox));
+                  found = true;
+                  break;
+                }
+              if (!found) p_->selectedValid = false;
+            }
+            return hit;
+          }
+
+          bool Pipeline::selectedFaceBox(float* out, int* outSource) const {
+            if (!p_ || !p_->selectedValid) return false;
+            if (out) std::memcpy(out, p_->selectedBox, sizeof(p_->selectedBox));
+            if (outSource) *outSource = p_->selectedSource;
+            return true;
+          }
+
+          bool Pipeline::setReferenceFaceAt(const ffcv::Image& frame, float x, float y,
+                                            float* outBox) {
+            if (!p_) return false;
+            auto faces = analyse(frame, false, true);
+            for (const auto& f : faces) {
+              if (x < f.box[0] || x > f.box[2] || y < f.box[1] || y > f.box[3]) continue;
+              if (outBox) std::memcpy(outBox, f.box, sizeof(f.box));
+              p_->reference.assign(f.embeddingNorm, f.embeddingNorm + 512);
+              p_->hasReference = true;
+              return true;
+            }
+            return false;
+          }
+
+          void Pipeline::setReferenceEmbedding(const float* e) {
+            if (!p_ || !e) return;
+            p_->reference.assign(e, e + 512);
+            p_->hasReference = true;
+          }
+
+          bool Pipeline::referenceEmbedding(float* out) const {
+            if (!p_ || !p_->hasReference) return false;
+            if (out) std::memcpy(out, p_->reference.data(), 512 * sizeof(float));
+            return true;
+          }
+
+          void Pipeline::clearReferenceFace() { if (p_) { p_->hasReference = false; p_->reference.clear(); } }
+          bool Pipeline::hasReferenceFace() const { return p_ && p_->hasReference; }
+
+          // ------------------------------------------------------------ audio
+
+          bool Pipeline::setAudio(const int16_t* pcm, size_t frames, int channels, int inRate,
+                                  double fps) {
+            if (!p_) return false;
+            p_->mel.clear();
+            p_->melCount = 0;
+            if (!pcm || frames == 0 || inRate <= 0) return true;
+
+            // Mono, 16 kHz, as ffaudio does.
+            std::vector<float> mono;
+            mono.reserve(frames);
+            for (size_t i = 0; i < frames; ++i) {
+              float s = 0.f;
+              for (int c = 0; c < channels; ++c) s += pcm[i * channels + c] / 32768.f;
+              mono.push_back(s / channels);
+            }
+            std::vector<float> res = ffaudio::resample(mono.data(), (int)mono.size(), inRate, 16000);
+
+            const int hop = 200;   // 12.5 ms at 16 kHz -> 80 frames/s
+            int count = fps > 0 ? (int)std::ceil((double)res.size() / 16000.0 * fps) : 0;
+            p_->mel.assign((size_t)count * 80 * 16, 0.f);
+            p_->melCount = count;
+            for (int w = 0; w < count; ++w) {
+              int start = (int)((double)w / fps * 16000.0);
+              for (int t = 0; t < 16; ++t) {
+                int i = start + t * hop;
+                float v = i < (int)res.size() ? res[i] : 0.f;
+                for (int b = 0; b < 80; ++b)
+                  p_->mel[((size_t)w * 80 + b) * 16 + t] = v;
+              }
+            }
+            return true;
+          }
+
+          const float* Pipeline::melWindow(int frameIndex) const {
+            if (!p_ || p_->melCount == 0) return nullptr;
+            if (frameIndex < 0 || frameIndex >= p_->melCount) {
+              static float silence[80 * 16] = {0.f};
+              return silence;
+            }
+            return &p_->mel[(size_t)frameIndex * 80 * 16];
+          }
+
+          int Pipeline::melWindowTotal() const { return p_ ? p_->melCount : 0; }
+
+          // ------------------------------------------------------------ swap
+
+          bool Pipeline::swapAll(ffcv::Image& frame, const std::vector<Face>& faces) {
+            if (!p_ || !p_->swp) { err_ = "swapper not loaded"; return false; }
+            if (!p_->swapEnabled || !p_->cfg.swapEnabled) return true;
+            if (p_->sources.empty()) return true;
+
+            const int S = p_->cfg.swapSize;
+            for (size_t i = 0; i < faces.size(); ++i) {
+              const Face& f = faces[i];
+              if (p_->cfg.swapLargestOnly && i != 0) break;
+
+              int slot = p_->active;
+              if (p_->assignEnabled || !p_->pins.empty()) {
+                for (const auto& pin : p_->pins)
+                  if (pin.box[2] > pin.box[0] && iou(pin.box, f.box) > 0.3f) {
+                    slot = pin.keep ? -1 : pin.source;
+                    break;
+                  }
+                if (p_->selectedValid && iou(p_->selectedBox, f.box) > 0.3f)
+                  slot = p_->selectedSource;
+              }
+              if (slot < 0) continue;                       // keep the original face
+              if (slot >= (int)p_->sources.size()) continue;
+
+              if (p_->hasReference) {
+                const auto& r = p_->reference;
+                float d = 0.f;
+                for (int k = 0; k < 512; ++k) d += f.embeddingNorm[k] * r[k];
+                d = (1.f - d) / 2.f;
+                if (d >= p_->cfg.referenceDistance) continue;
+              }
+
+              ffcv::Affine a;
+              ffcv::Image crop = warpByLandmark5(frame, f.landmark5_68, S, &a);
+              std::vector<float> t = toTensor(crop, p_->cfg.swapMean, p_->cfg.swapStd);
+
+              // Identity blend, upstream's arithmetic.
+              const float w = (p_->cfg.swapperWeight - 0.5f) * -0.7f;
+              const auto& src = p_->sources[slot].emb;
+              for (int k = 0; k < 512; ++k) {
+                float v = src[k] * (1.f - w) + f.embeddingNorm[k] * w;
+                for (int c = 0; c < 3; ++c) {
+                  size_t idx = (size_t)c * 512 + k;
+                  if (idx < t.size()) t[idx] = v;
+                }
+              }
+
+              auto names = ffnn::inputNames(p_->swp);
+              if (names.empty()) continue;
+              std::vector<const float*> data{ t.data() };
+              std::vector<std::vector<float>> outs;
+              if (!ffnn::execute(p_->swp, { names[0] }, data, outs) || outs.empty()) {
+                err_ = std::string("swapper execute: ") + ffnn::lastError();
+                continue;
+              }
+
+              // Output -> 0..255 BGR crop.
+              ffcv::MatF out(S, S, 3);
+              const auto& o = outs[0];
+              for (size_t k = 0; k < out.data.size() && k < o.size(); ++k) {
+                float v = o[k];
+                if (p_->cfg.swapDenorm) v = v * 255.f * p_->cfg.swapStd + p_->cfg.swapMean * 255.f;
+                out.data[k] = std::min(255.f, std::max(0.f, v));
+              }
+
+              ffcv::MatF mask = ffcv::createBoxMask(S, S, p_->cfg.maskBlur, p_->cfg.maskPadding);
+              ffcv::pasteBack(frame, out, mask, a);
+              facesDone++;
+            }
+            framesDone++;
+            return true;
+          }
+
+          void Pipeline::setSwapEnabled(bool enabled) { if (p_) p_->swapEnabled = enabled; }
+          void Pipeline::setSwapLargestOnly(bool enabled) {
+            if (p_) p_->cfg.swapLargestOnly = enabled;
+          }
+
+          bool Pipeline::enhance(ffcv::Image& frame, const std::vector<Face>& faces) {
+            if (!p_ || !p_->enh || !p_->cfg.faceEnhance) return true;
+            const int S = 512;
+            for (const auto& f : faces) {
+              ffcv::Affine a;
+              ffcv::Image crop = warpByLandmark5(frame, f.landmark5_68, S, &a);
+              std::vector<float> t = toTensor(crop, 0.5f, 0.5f);
+              auto names = ffnn::inputNames(p_->enh);
+              if (names.empty()) continue;
+              std::vector<const float*> data{ t.data() };
+              std::vector<std::vector<float>> outs;
+              if (!ffnn::execute(p_->enh, { names[0] }, data, outs) || outs.empty()) continue;
+
+              const float blend = p_->cfg.faceEnhancerBlend;
+              ffcv::MatF out(S, S, 3);
+              for (size_t k = 0; k < out.data.size() && k < outs[0].size(); ++k) {
+                float v = outs[0][k] * 255.f * 0.5f + 127.5f;
+                v = std::min(255.f, std::max(0.f, v));
+                out.data[k] = crop.data[k] * (1.f - blend) + v * blend;
+              }
+              ffcv::MatF mask = ffcv::createBoxMask(S, S, p_->cfg.maskBlur, p_->cfg.maskPadding);
+              ffcv::pasteBack(frame, out, mask, a);
+            }
+            return true;
+          }
+
+          bool Pipeline::syncLip(ffcv::Image& frame, const std::vector<Face>& faces,
+                                 const float* melWindow) {
+            if (!p_ || !p_->lip || !melWindow) return true;
+            for (const auto& f : faces) {
+              ffcv::Affine a512;
+              ffcv::Image ffhq = warpByLandmark5(frame, f.landmark5_68, kFfhq, &a512);
+
+              // 68 points into the 512 crop, box from them, warp that to 96.
+              float pts[136];
+              std::memcpy(pts, f.landmark68, sizeof(pts));
+              ffcv::transformPoints(pts, 68, a512, pts);
+              float box[4];
+              ffcv::createBoundingBox(pts, box);
+              ffcv::Affine a96;
+              ffcv::Image mouth = ffcv::warpFaceByBoundingBox(ffhq, box, kLip, &a96);
+
+              std::vector<float> faceT = toTensor(mouth, 0.5f, 0.5f);
+              std::vector<float> melT(melWindow, melWindow + 80 * 16);
+              auto names = ffnn::inputNames(p_->lip);
+              if (names.size() < 2) continue;
+              std::vector<const float*> data{ faceT.data(), melT.data() };
+              std::vector<std::vector<float>> outs;
+              if (!ffnn::execute(p_->lip, { names[0], names[1] }, data, outs) || outs.empty())
+                continue;
+
+              ffcv::MatF out(kLip, kLip, 3);
+              for (size_t k = 0; k < out.data.size() && k < outs[0].size(); ++k)
+                out.data[k] = std::min(255.f, std::max(0.f, outs[0][k] * 255.f * 0.5f + 127.5f));
+
+              ffcv::MatF mask = ffcv::createAreaMask(kLip, kLip, pts, ffcv::AREA_MOUTH);
+              ffcv::pasteBack(ffhq, out, mask, ffcv::invertAffine(a96));
+
+              // 512 crop back into the frame.
+              ffcv::MatF whole(kFfhq, kFfhq, 3);
+              for (size_t k = 0; k < whole.data.size(); ++k) whole.data[k] = ffhq.data[k];
+              ffcv::MatF full(kFfhq, kFfhq, 1);
+              std::fill(full.data.begin(), full.data.end(), 1.f);
+              blur3x3(full);
+              ffcv::pasteBack(frame, whole, full, a512);
+            }
+            return true;
+          }
+
+          }  // namespace ffpipe
+          EOF
 
       - name: Show resolved build files
         working-directory: work/android
@@ -155,18 +1060,6 @@ jobs:
           echo "===== installed cmake ====="
           ls -1 "$ANDROID_HOME/cmake" 2>/dev/null || echo "none"
 
-      # The QNN headers and runtime are gitignored (proprietary, ~50 MB of .so, from a
-      # 1.3 GB archive), so a clean checkout has none and CMake cannot configure. Fetch
-      # the public QAIRT runtime and let the project's own stage_qnn.sh lay it out, so
-      # the CI tree matches a local build.
-      #
-      # The software-center URL is unauthenticated, but its gateway has dropped anonymous
-      # downloads before (403 InvalidAccessKeyId for every version, Nov 2026), so this
-      # retries and then fails loudly rather than letting a truncated extract reach the
-      # compiler.
-      #
-      # Only the three needed subtrees are extracted -- the rest is host tooling and
-      # x86/QNX/SA targets this build never opens.
       - name: Stage QNN runtime
         working-directory: work/android
         run: |
@@ -205,9 +1098,6 @@ jobs:
           fi
           rm -f "$ZIP"
 
-          # The archive nests the SDK under qairt/<version>/ and the depth has moved
-          # between releases, so locate it by a file that is actually needed rather than
-          # assuming a layout.
           HEADER=$(find "$EXTRACT" -type f -path '*/include/QNN/QnnBackend.h' | head -n1)
           if [ -z "$HEADER" ]; then
             echo "::error::No include/QNN/QnnBackend.h in the QAIRT archive -- layout changed"
@@ -222,8 +1112,6 @@ jobs:
             exit 1
           fi
 
-          # Never reach the compiler with a half-staged tree: everything stage_qnn.sh will
-          # ask for must already be in the archive.
           missing=0
           for lib in libQnnHtp.so libQnnSystem.so "libQnnHtpV${QNN_HTP_TIERS}Stub.so"; do
             if [ ! -f "$SDK_ROOT/lib/aarch64-android/$lib" ]; then
@@ -242,17 +1130,12 @@ jobs:
 
           QNN_SDK_ROOT="$SDK_ROOT" bash stage_qnn.sh
 
-      # Not ceremony: this rejects zero-byte .so files. A truncated download that unzips
-      # "successfully" is the one failure mode that otherwise sails through staging and
-      # dies much later in linkDebugDebug with a missing-symbol message.
       - name: Verify staged QNN
         working-directory: work/android
         run: |
           set -euo pipefail
           JNI=app/src/main/jniLibs/arm64-v8a
-          echo "--- header ---"
           ls -l app/src/main/cpp/include/QNN/QnnBackend.h
-          echo "--- runtime ---"
           ls -l "$JNI"
           for f in libQnnHtp.so libQnnSystem.so "libQnnHtpV${QNN_HTP_TIERS}Stub.so" "libQnnHtpV${QNN_HTP_TIERS}Skel.so"; do
             test -s "$JNI/$f" || { echo "::error::missing or empty: $f"; exit 1; }
