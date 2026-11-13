@@ -8,10 +8,28 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# QAIRT runtime release to stage. Overridable per-run, so a Qualcomm-side 403 or a
+# pulled build is a one-line change.
+#
+# QNN_HTP_TIERS is pinned to 73 deliberately. stage_qnn.sh hard-fails if ANY tier it
+# is asked for is absent, and the project default is all six (68 69 73 75 79 81).
+# Asking for one tier keeps a staging failure meaningful instead of dependent on what
+# an SDK release still ships -- and v73 is what the test device's 8 Gen 2 actually is.
+#
+# The Gradle qnnStage task reads the SAME variable, so its required/forbidden checks
+# agree with what the script staged. Never set one without the other.
+env:
+  QAIRT_VERSION: 2.40.0.251030
+  QNN_HTP_TIERS: "73"
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,18 +45,185 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1'
 
-      - name: Show toolchain versions
+      # ---------------------------------------------------------------------
+      # Repair the two build files this tree cannot configure with.
+      #
+      # 1. settings.gradle.kts declares no plugin versions and there is no version
+      #    catalog, so `com.android.application` resolves to nothing and every run
+      #    dies at configure time with UnknownPluginException.
+      #
+      # 2. build.gradle.kts (root) is a near-copy of app/build.gradle.kts: it applies
+      #    com.android.application and an android{} block with no src/main of its own,
+      #    and points externalNativeBuild at src/main/cpp/CMakeLists.txt, which only
+      #    exists under app/. Root is therefore a second, empty app module that fails
+      #    on a missing manifest.
+      #
+      # Both are rewritten to the conventional shape: versions pinned in
+      # pluginManagement, root reduced to `apply false`. Rewritten every run rather
+      # than patched, so the result does not depend on what the file happened to
+      # contain.
+      # ---------------------------------------------------------------------
+      - name: Write settings.gradle.kts
+        working-directory: work/android
         run: |
-          echo "--- project expects ---"
-          grep -nE 'ndkVersion|cmake|compileSdk|buildToolsVersion' work/android/app/build.gradle.kts || true
-          echo "--- installed NDKs ---"
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+              plugins {
+                  id("com.android.application") version "8.9.2"
+                  id("org.jetbrains.kotlin.android") version "2.1.0"
+                  id("org.jetbrains.kotlin.plugin.compose") version "2.1.0"
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "facefusion-mobile"
+          include(":app")
+          EOF
+
+      - name: Write root build.gradle.kts
+        working-directory: work/android
+        run: |
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") apply false
+              id("org.jetbrains.kotlin.android") apply false
+              id("org.jetbrains.kotlin.plugin.compose") apply false
+          }
+          EOF
+
+      - name: Show resolved build files
+        working-directory: work/android
+        run: |
+          echo "===== settings.gradle.kts ====="
+          cat settings.gradle.kts
+          echo "===== build.gradle.kts (root) ====="
+          cat build.gradle.kts
+          echo "===== toolchain the app expects ====="
+          grep -nE 'ndkVersion|version *=|compileSdk|minSdk|targetSdk' app/build.gradle.kts || true
+          echo "===== installed NDKs ====="
           ls -1 "$ANDROID_HOME/ndk" 2>/dev/null || echo "none"
+          echo "===== installed cmake ====="
+          ls -1 "$ANDROID_HOME/cmake" 2>/dev/null || echo "none"
+
+      # The QNN headers and runtime are gitignored (proprietary, ~50 MB), so a clean
+      # checkout has none and CMake cannot configure. Fetch the public QAIRT runtime
+      # and let the project's own stage_qnn.sh lay it out, so the CI tree matches a
+      # local build.
+      #
+      # The software-center URL is unauthenticated, but its gateway has dropped
+      # anonymous downloads before (403 InvalidAccessKeyId for every version, Nov
+      # 2026), so this retries and then fails loudly rather than letting a truncated
+      # extract reach the compiler.
+      #
+      # Only the three needed subtrees are extracted -- the full archive is several
+      # GB of host tooling this build never opens.
+      - name: Stage QNN runtime
+        working-directory: work/android
+        run: |
+          set -euo pipefail
+
+          URL="https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip"
+          WORK="$RUNNER_TEMP/qairt-stage"
+          ZIP="$WORK/qnn.zip"
+          EXTRACT="$WORK/extract"
+          mkdir -p "$WORK" "$EXTRACT"
+
+          echo "Downloading QAIRT ${QAIRT_VERSION}"
+          ok=0
+          for attempt in 1 2 3 4; do
+            echo "  attempt ${attempt}/4"
+            if curl -fL --retry 2 --retry-delay 5 --connect-timeout 30 -o "$ZIP" "$URL"; then
+              ok=1
+              break
+            fi
+            sleep $((attempt * 10))
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::QAIRT ${QAIRT_VERSION} download failed after 4 attempts: $URL"
+            exit 1
+          fi
+          ls -l "$ZIP"
+          echo "sha256: $(sha256sum "$ZIP" | cut -d' ' -f1)"
+
+          unzip -q -o "$ZIP" '*/include/QNN/*' -d "$EXTRACT" || true
+          unzip -q -o "$ZIP" '*/lib/aarch64-android/*' -d "$EXTRACT" || true
+          unzip -q -o "$ZIP" '*/lib/hexagon-v*/unsigned/*' -d "$EXTRACT" || true
+
+          if ! find "$EXTRACT" -type f -path '*/include/QNN/QnnBackend.h' | grep -q .; then
+            echo "selective extract missed the headers; extracting the whole archive"
+            unzip -q -o "$ZIP" -d "$EXTRACT"
+          fi
+          rm -f "$ZIP"
+
+          # The archive nests the SDK under qairt/<version>/ and the depth has moved
+          # between releases, so locate it by a file that is actually needed rather
+          # than assuming a layout.
+          HEADER=$(find "$EXTRACT" -type f -path '*/include/QNN/QnnBackend.h' | head -n1)
+          if [ -z "$HEADER" ]; then
+            echo "::error::No include/QNN/QnnBackend.h in the QAIRT archive -- layout changed"
+            find "$EXTRACT" -maxdepth 3 -type d | head -n40
+            exit 1
+          fi
+          SDK_ROOT="${HEADER%/include/QNN/QnnBackend.h}"
+          echo "SDK root: $SDK_ROOT"
+
+          if [ ! -d "$SDK_ROOT/lib/aarch64-android" ]; then
+            echo "::error::No lib/aarch64-android under $SDK_ROOT"
+            exit 1
+          fi
+
+          # Never reach the compiler with a half-staged tree: everything stage_qnn.sh
+          # will ask for must already be in the archive.
+          missing=0
+          for lib in libQnnHtp.so libQnnSystem.so "libQnnHtpV${QNN_HTP_TIERS}Stub.so"; do
+            if [ ! -f "$SDK_ROOT/lib/aarch64-android/$lib" ]; then
+              echo "::error::Missing Android runtime in SDK: $lib"
+              missing=1
+            fi
+          done
+          SKEL="$SDK_ROOT/lib/hexagon-v${QNN_HTP_TIERS}/unsigned/libQnnHtpV${QNN_HTP_TIERS}Skel.so"
+          if [ ! -f "$SKEL" ]; then
+            echo "::error::Missing Hexagon skel in SDK: $SKEL"
+            echo "  available tiers:"
+            ls -1d "$SDK_ROOT"/lib/hexagon-v* 2>/dev/null || true
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+
+          QNN_SDK_ROOT="$SDK_ROOT" bash stage_qnn.sh
+
+      # Not ceremony: this rejects zero-byte .so files. A truncated download that
+      # unzips "successfully" is the one failure mode that otherwise sails through
+      # staging and dies much later in linkDebugDebug with a missing-symbol message.
+      - name: Verify staged QNN
+        working-directory: work/android
+        run: |
+          set -euo pipefail
+          JNI=app/src/main/jniLibs/arm64-v8a
+          echo "--- header ---"
+          ls -l app/src/main/cpp/include/QNN/QnnBackend.h
+          echo "--- runtime ---"
+          ls -l "$JNI"
+          for f in libQnnHtp.so libQnnSystem.so "libQnnHtpV${QNN_HTP_TIERS}Stub.so" "libQnnHtpV${QNN_HTP_TIERS}Skel.so"; do
+            test -s "$JNI/$f" || { echo "::error::missing or empty: $f"; exit 1; }
+          done
+          echo "staged ok"
 
       - name: Build debug APK
         working-directory: work/android
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Show APK
+        if: always()
+        working-directory: work/android
+        run: |
+          ls -l app/build/outputs/apk/debug/ 2>/dev/null || echo "no apk"
+          sha256sum app/build/outputs/apk/debug/*.apk 2>/dev/null || true
 
       - name: Upload APK
         if: always()
@@ -48,3 +233,14 @@ jobs:
           path: work/android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: ignore
           retention-days: 30
+
+      - name: Upload build reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: |
+            work/android/**/build/reports/**
+            work/android/**/.cxx/**
+          if-no-files-found: ignore
+          retention-days: 7
