@@ -27,7 +27,7 @@ jobs:
       - name: Setup NDK
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r26b
+          ndk-version: r27.2
 
       - name: Accept Android Licenses
         run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
@@ -38,10 +38,10 @@ jobs:
       - name: Build Release APK
         run: |
           cd work/android
-          ./gradlew assembleRelease --stacktrace
+          ./gradlew assembleDebug --stacktrace
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FaceFusion-mobile-no-censorship
-          path: work/android/app/build/outputs/apk/release/*.apk
+          path: work/android/app/build/outputs/apk/debug/*.apk
