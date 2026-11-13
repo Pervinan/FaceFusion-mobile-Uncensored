@@ -46,7 +46,7 @@ jobs:
           packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018 cmake;3.22.1'
 
       # ---------------------------------------------------------------------
-      # Repair the two build files this tree cannot configure with.
+      # Repair the build files this tree cannot configure with.
       #
       # 1. settings.gradle.kts declares no plugin versions and there is no version
       #    catalog, so `com.android.application` resolves to nothing and every run
@@ -60,8 +60,7 @@ jobs:
       #
       # Both are rewritten to the conventional shape: versions pinned in
       # pluginManagement, root reduced to `apply false`. Rewritten every run rather
-      # than patched, so the result does not depend on what the file happened to
-      # contain.
+      # than patched, so the result does not depend on what the file contained.
       # ---------------------------------------------------------------------
       - name: Write settings.gradle.kts
         working-directory: work/android
@@ -94,6 +93,54 @@ jobs:
           }
           EOF
 
+      # ContentGate.kt:sampleByRetriever ends its try block with
+      #
+      #   val verdict = if (sampled == 0) Verdict.ALLOW else verdictOf(sampled, flagged, worst)
+      #   verdict
+      #
+      # One branch is the Verdict ENUM, the other is a Result. Their common supertype is
+      # Any, so the try block is Any while the function declares Result? -- and Kotlin 2.1
+      # rejects it outright:
+      #
+      #   Return type mismatch: expected 'ContentGate.Result?', actual 'kotlin.Any'
+      #
+      # Both branches are made to yield a Result instead. The -999.0f sentinel matches the
+      # one the duration-unavailable branch already uses, so "nothing was sampled" is
+      # distinguishable from a real score rather than looking like a confident zero.
+      #
+      # The `assert` makes this fail here, with the reason, if the file is ever reshaped
+      # rather than silently applying a no-op and letting the compiler complain again.
+      - name: Patch ContentGate.kt return type
+        working-directory: work/android
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+
+          path = pathlib.Path("app/src/main/java/com/facefusion/mobile/ContentGate.kt")
+          src = path.read_text()
+
+          old = (
+              "            val verdict = if (sampled == 0) Verdict.ALLOW else verdictOf(sampled, flagged, worst)\n"
+              "            verdict\n"
+          )
+          new = (
+              "            if (sampled == 0) {\n"
+              "                Result(Verdict.ALLOW, -999.0f, detail = \"no frames sampled\")\n"
+              "            } else {\n"
+              "                verdictOf(sampled, flagged, worst)\n"
+              "            }\n"
+          )
+
+          if old not in src:
+              sys.exit("ContentGate.kt no longer contains the two-line verdict block")
+
+          path.write_text(src.replace(old, new, 1))
+          print("patched", path)
+          PY
+
+          echo "--- patched region ---"
+          sed -n '76,92p' app/src/main/java/com/facefusion/mobile/ContentGate.kt
+
       - name: Show resolved build files
         working-directory: work/android
         run: |
@@ -108,18 +155,18 @@ jobs:
           echo "===== installed cmake ====="
           ls -1 "$ANDROID_HOME/cmake" 2>/dev/null || echo "none"
 
-      # The QNN headers and runtime are gitignored (proprietary, ~50 MB), so a clean
-      # checkout has none and CMake cannot configure. Fetch the public QAIRT runtime
-      # and let the project's own stage_qnn.sh lay it out, so the CI tree matches a
-      # local build.
+      # The QNN headers and runtime are gitignored (proprietary, ~50 MB of .so, from a
+      # 1.3 GB archive), so a clean checkout has none and CMake cannot configure. Fetch
+      # the public QAIRT runtime and let the project's own stage_qnn.sh lay it out, so
+      # the CI tree matches a local build.
       #
-      # The software-center URL is unauthenticated, but its gateway has dropped
-      # anonymous downloads before (403 InvalidAccessKeyId for every version, Nov
-      # 2026), so this retries and then fails loudly rather than letting a truncated
-      # extract reach the compiler.
+      # The software-center URL is unauthenticated, but its gateway has dropped anonymous
+      # downloads before (403 InvalidAccessKeyId for every version, Nov 2026), so this
+      # retries and then fails loudly rather than letting a truncated extract reach the
+      # compiler.
       #
-      # Only the three needed subtrees are extracted -- the full archive is several
-      # GB of host tooling this build never opens.
+      # Only the three needed subtrees are extracted -- the rest is host tooling and
+      # x86/QNX/SA targets this build never opens.
       - name: Stage QNN runtime
         working-directory: work/android
         run: |
@@ -159,8 +206,8 @@ jobs:
           rm -f "$ZIP"
 
           # The archive nests the SDK under qairt/<version>/ and the depth has moved
-          # between releases, so locate it by a file that is actually needed rather
-          # than assuming a layout.
+          # between releases, so locate it by a file that is actually needed rather than
+          # assuming a layout.
           HEADER=$(find "$EXTRACT" -type f -path '*/include/QNN/QnnBackend.h' | head -n1)
           if [ -z "$HEADER" ]; then
             echo "::error::No include/QNN/QnnBackend.h in the QAIRT archive -- layout changed"
@@ -175,8 +222,8 @@ jobs:
             exit 1
           fi
 
-          # Never reach the compiler with a half-staged tree: everything stage_qnn.sh
-          # will ask for must already be in the archive.
+          # Never reach the compiler with a half-staged tree: everything stage_qnn.sh will
+          # ask for must already be in the archive.
           missing=0
           for lib in libQnnHtp.so libQnnSystem.so "libQnnHtpV${QNN_HTP_TIERS}Stub.so"; do
             if [ ! -f "$SDK_ROOT/lib/aarch64-android/$lib" ]; then
@@ -195,9 +242,9 @@ jobs:
 
           QNN_SDK_ROOT="$SDK_ROOT" bash stage_qnn.sh
 
-      # Not ceremony: this rejects zero-byte .so files. A truncated download that
-      # unzips "successfully" is the one failure mode that otherwise sails through
-      # staging and dies much later in linkDebugDebug with a missing-symbol message.
+      # Not ceremony: this rejects zero-byte .so files. A truncated download that unzips
+      # "successfully" is the one failure mode that otherwise sails through staging and
+      # dies much later in linkDebugDebug with a missing-symbol message.
       - name: Verify staged QNN
         working-directory: work/android
         run: |
